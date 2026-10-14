@@ -49,19 +49,40 @@ test(
   "evicts inactive sessions on the TTL sweep",
   { skip: typeof mock.timers?.enable !== "function" && "mock.timers requires Node >= 20.4" },
   () => {
-    mock.timers.enable({ apis: ["Date", "setInterval"], now: 1_000_000 });
+    // Node 20.4+ takes an options object and can mock Date; Node 18 only
+    // accepts an array of timer APIs (no Date), so Date.now is mocked by hand.
+    const nodeMajor = Number(process.versions.node.split(".")[0]);
+    let now = 1_000_000;
+    let tick = (ms: number) => mock.timers.tick(ms);
+    if (nodeMajor >= 20) {
+      mock.timers.enable({ apis: ["Date", "setInterval"], now });
+    } else {
+      (mock.timers.enable as unknown as (apis: string[]) => void)(["setInterval"]);
+      // Node 18's mocked setInterval returns a bare numeric id with no
+      // .unref(), which sessionStore calls; hand back a handle that has one.
+      const mockedSetInterval = globalThis.setInterval;
+      mock.method(globalThis, "setInterval", (...args: Parameters<typeof setInterval>) => {
+        const id = mockedSetInterval(...args);
+        return { id, ref: () => {}, unref: () => {} };
+      });
+      mock.method(Date, "now", () => now);
+      tick = (ms: number) => {
+        now += ms;
+        mock.timers.tick(ms);
+      };
+    }
     try {
       const store = createSessionStore();
 
       const stale = store.get("stale", "fallback-stale");
       stale.history.push({ role: "user", content: "stale-msg" });
 
-      mock.timers.tick(25 * 60 * 1000);
+      tick(25 * 60 * 1000);
 
       const active = store.get("active", "fallback-active");
       active.history.push({ role: "user", content: "active-msg" });
 
-      mock.timers.tick(10 * 60 * 1000);
+      tick(10 * 60 * 1000);
 
       const staleAfter = store.get("stale", "fallback-stale");
       assert.deepEqual(staleAfter.history, []);
@@ -70,6 +91,7 @@ test(
       assert.equal(activeAfter.history[0]?.content, "active-msg");
     } finally {
       mock.timers.reset();
+      mock.restoreAll();
     }
   },
 );
